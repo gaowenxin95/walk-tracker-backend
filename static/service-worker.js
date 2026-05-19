@@ -1,4 +1,4 @@
-const CACHE_NAME = "walk-tracker-v3";
+const CACHE_NAME = "walk-tracker-v4";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
@@ -32,7 +32,8 @@ self.addEventListener("fetch", (event) => {
     url.pathname.startsWith("/captcha-image/") ||
     url.pathname === "/me" ||
     url.pathname === "/login" ||
-    url.pathname === "/logout"
+    url.pathname === "/logout" ||
+    url.pathname === "/profile"
   ) {
     event.respondWith(fetch(event.request));
     return;

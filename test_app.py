@@ -96,11 +96,27 @@ class WalkTrackerTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.app.validate_captcha(captcha["captcha_id"], "wrong")
 
-        session = self.app.create_session("高文欣")
+        session = self.app.create_session("高文欣", "13800138000")
         found = self.app.get_session(session["token"])
 
         self.assertEqual(found["name"], "高文欣")
+        self.assertEqual(found["phone"], "13800138000")
         self.assertEqual(found["user_id"], session["user_id"])
+
+    def test_profile_helpers(self):
+        session = self.app.create_session("高文欣", "13800138000")
+        profile = self.app.upsert_profile(
+            session,
+            name="高文欣",
+            phone="13800138000",
+            height_cm=168,
+            weight_kg=58.5,
+            target_weight_kg=55,
+        )
+
+        self.assertEqual(profile["height_cm"], 168)
+        self.assertEqual(profile["weight_kg"], 58.5)
+        self.assertEqual(profile["target_weight_kg"], 55)
 
 
 if __name__ == "__main__":

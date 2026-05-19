@@ -31,12 +31,16 @@ DB_PATH = Path(os.environ.get("WALK_TRACKER_DB", DATA_DIR / "walk_records.sqlite
 DEFAULT_USER_ID = "default"
 DEFAULT_STRIDE_METERS = 0.7
 DEFAULT_ACTIVITY_TYPE = "walk"
-ACTIVITY_TYPES = {"walk", "run", "rope", "swim"}
+ACTIVITY_TYPES = {"walk", "run", "rope", "swim", "hike", "climb", "cycle", "yoga"}
 ACTIVITY_METS = {
     "walk": 3.5,
     "run": 8.3,
     "rope": 10.0,
     "swim": 7.0,
+    "hike": 6.0,
+    "climb": 8.0,
+    "cycle": 7.5,
+    "yoga": 2.5,
 }
 DEFAULT_WEIGHT_KG = 60
 CAPTCHA_TTL_SECONDS = 10 * 60
@@ -156,8 +160,27 @@ def normalize_name(value: Any) -> str:
     return " ".join(name.split())
 
 
-def user_id_for_name(name: str) -> str:
-    digest = hashlib.sha256(name.lower().encode("utf-8")).hexdigest()
+def normalize_phone(value: Any) -> str:
+    phone = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(phone) != 11:
+        raise ValueError("phone must be an 11 digit mobile number")
+    return phone
+
+
+def normalize_optional_float(value: Any, field_name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a number") from exc
+    if number <= 0:
+        raise ValueError(f"{field_name} must be greater than 0")
+    return round(number, 1)
+
+
+def user_id_for_phone(phone: str) -> str:
+    digest = hashlib.sha256(phone.encode("utf-8")).hexdigest()
     return f"user_{digest[:16]}"
 
 
@@ -265,20 +288,33 @@ def validate_captcha(captcha_id: Any, answer: Any) -> None:
         )
 
 
-def create_session(name: str) -> dict[str, str]:
-    user_id = user_id_for_name(name)
+def create_session(name: str, phone: str) -> dict[str, str]:
+    user_id = user_id_for_phone(phone)
     token = secrets.token_urlsafe(32)
     expires_at = now_ts() + SESSION_TTL_SECONDS
     with connect_db() as conn:
         conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now_ts(),))
         conn.execute(
             """
-            INSERT INTO sessions (token, user_id, name, expires_at, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO user_profiles (
+                user_id, name, phone, height_cm, weight_kg, target_weight_kg, updated_at
+            )
+            VALUES (?, ?, ?, NULL, NULL, NULL, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                name = excluded.name,
+                phone = excluded.phone,
+                updated_at = excluded.updated_at
             """,
-            (token, user_id, name, expires_at, utc_now_iso()),
+            (user_id, name, phone, utc_now_iso()),
         )
-    return {"token": token, "user_id": user_id, "name": name}
+        conn.execute(
+            """
+            INSERT INTO sessions (token, user_id, name, phone, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (token, user_id, name, phone, expires_at, utc_now_iso()),
+        )
+    return {"token": token, "user_id": user_id, "name": name, "phone": phone}
 
 
 def get_session(token: str | None) -> dict[str, str] | None:
@@ -291,7 +327,84 @@ def get_session(token: str | None) -> dict[str, str] | None:
         ).fetchone()
     if row is None:
         return None
-    return {"user_id": row["user_id"], "name": row["name"], "token": row["token"]}
+    if not row["phone"]:
+        return None
+    return {
+        "user_id": row["user_id"],
+        "name": row["name"],
+        "phone": row["phone"],
+        "token": row["token"],
+    }
+
+
+def row_to_profile(row: sqlite3.Row | None, session: dict[str, str]) -> dict[str, Any]:
+    if row is None:
+        return {
+            "name": session["name"],
+            "phone": session["phone"],
+            "height_cm": None,
+            "weight_kg": None,
+            "target_weight_kg": None,
+        }
+    return {
+        "name": row["name"],
+        "phone": row["phone"],
+        "height_cm": row["height_cm"],
+        "weight_kg": row["weight_kg"],
+        "target_weight_kg": row["target_weight_kg"],
+    }
+
+
+def get_profile(session: dict[str, str]) -> dict[str, Any]:
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_profiles WHERE user_id = ?",
+            (session["user_id"],),
+        ).fetchone()
+    return row_to_profile(row, session)
+
+
+def upsert_profile(
+    session: dict[str, str],
+    *,
+    name: str,
+    phone: str,
+    height_cm: float | None,
+    weight_kg: float | None,
+    target_weight_kg: float | None,
+) -> dict[str, Any]:
+    if phone != session["phone"]:
+        raise ValueError("phone cannot be changed after login")
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_profiles (
+                user_id, name, phone, height_cm, weight_kg, target_weight_kg, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                name = excluded.name,
+                height_cm = excluded.height_cm,
+                weight_kg = excluded.weight_kg,
+                target_weight_kg = excluded.target_weight_kg,
+                updated_at = excluded.updated_at
+            """,
+            (
+                session["user_id"],
+                name,
+                phone,
+                height_cm,
+                weight_kg,
+                target_weight_kg,
+                utc_now_iso(),
+            ),
+        )
+        conn.execute(
+            "UPDATE sessions SET name = ? WHERE token = ?",
+            (name, session["token"]),
+        )
+    session["name"] = name
+    return get_profile(session)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -343,8 +456,23 @@ def init_db() -> None:
                 token TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 name TEXT NOT NULL,
+                phone TEXT NOT NULL DEFAULT '',
                 expires_at INTEGER NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        ensure_column(conn, "sessions", "phone", "phone TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                height_cm REAL,
+                weight_kg REAL,
+                target_weight_kg REAL,
+                updated_at TEXT NOT NULL
             )
             """
         )
@@ -580,7 +708,12 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 if session is None:
                     self.send_error_json(401, "login required")
                     return
-                self.send_json({"user": {"name": session["name"]}})
+                self.send_json({"user": {"name": session["name"], "phone": session["phone"]}})
+                return
+
+            if path == "/profile":
+                session = self.require_session()
+                self.send_json({"profile": get_profile(session)})
                 return
 
             session = self.require_session()
@@ -621,10 +754,11 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
             if path == "/login":
                 payload = self.read_json_body()
                 name = normalize_name(payload.get("name"))
+                phone = normalize_phone(payload.get("phone"))
                 validate_captcha(payload.get("captcha_id"), payload.get("captcha_answer"))
-                session = create_session(name)
+                session = create_session(name, phone)
                 self.send_json(
-                    {"user": {"name": session["name"]}},
+                    {"user": {"name": session["name"], "phone": session["phone"]}},
                     status=201,
                     headers={"Set-Cookie": self.session_cookie(session["token"])},
                 )
@@ -635,6 +769,22 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                     {"ok": True},
                     headers={"Set-Cookie": self.clear_session_cookie()},
                 )
+                return
+
+            if path == "/profile":
+                session = self.require_session()
+                payload = self.read_json_body()
+                profile = upsert_profile(
+                    session,
+                    name=normalize_name(payload.get("name")),
+                    phone=normalize_phone(payload.get("phone")),
+                    height_cm=normalize_optional_float(payload.get("height_cm"), "height_cm"),
+                    weight_kg=normalize_optional_float(payload.get("weight_kg"), "weight_kg"),
+                    target_weight_kg=normalize_optional_float(
+                        payload.get("target_weight_kg"), "target_weight_kg"
+                    ),
+                )
+                self.send_json({"profile": profile, "user": {"name": profile["name"], "phone": profile["phone"]}})
                 return
 
             if path != "/records/check-in":
