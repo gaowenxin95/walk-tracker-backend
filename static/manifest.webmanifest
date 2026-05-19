@@ -1,0 +1,19 @@
+{
+  "name": "走路打卡",
+  "short_name": "走路打卡",
+  "description": "记录每日走路打卡、步数和公里数。",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f4",
+  "theme_color": "#247a4d",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

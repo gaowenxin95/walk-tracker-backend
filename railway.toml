@@ -1,0 +1,9 @@
+[build]
+builder = "RAILPACK"
+buildCommand = "python3 -m py_compile app.py"
+
+[deploy]
+startCommand = "python3 app.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
