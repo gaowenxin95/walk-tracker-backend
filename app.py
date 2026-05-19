@@ -7,11 +7,16 @@ Run with:
 
 from __future__ import annotations
 
+import hashlib
+import html
 import json
 import mimetypes
 import os
+import secrets
 import sqlite3
+import time
 from datetime import date, datetime, timedelta
+from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -34,6 +39,10 @@ ACTIVITY_METS = {
     "swim": 7.0,
 }
 DEFAULT_WEIGHT_KG = 60
+CAPTCHA_TTL_SECONDS = 10 * 60
+SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+CAPTCHA_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+SESSION_COOKIE_NAME = "walk_session"
 DEFAULT_HOST = os.environ.get("HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("PORT", "8000"))
 
@@ -134,6 +143,157 @@ def estimate_calories(activity_type: str, duration_minutes: int) -> int:
     return round(met * 3.5 * DEFAULT_WEIGHT_KG / 200 * duration_minutes)
 
 
+def now_ts() -> int:
+    return int(time.time())
+
+
+def normalize_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if len(name) < 1:
+        raise ValueError("name is required")
+    if len(name) > 30:
+        raise ValueError("name must be 30 characters or fewer")
+    return " ".join(name.split())
+
+
+def user_id_for_name(name: str) -> str:
+    digest = hashlib.sha256(name.lower().encode("utf-8")).hexdigest()
+    return f"user_{digest[:16]}"
+
+
+def hash_captcha(answer: str) -> str:
+    return hashlib.sha256(answer.upper().encode("utf-8")).hexdigest()
+
+
+def generate_captcha_answer(length: int = 5) -> str:
+    return "".join(secrets.choice(CAPTCHA_ALPHABET) for _ in range(length))
+
+
+def captcha_svg(answer: str) -> str:
+    width = 180
+    height = 70
+    text_items = []
+    line_items = []
+    dot_items = []
+
+    for index, char in enumerate(answer):
+        x = 26 + index * 28 + secrets.randbelow(8)
+        y = 43 + secrets.randbelow(10)
+        rotate = secrets.choice([-12, -7, 4, 9, 13])
+        color = secrets.choice(["#174d35", "#111815", "#2f6c52", "#a34b32"])
+        text_items.append(
+            f'<text x="{x}" y="{y}" transform="rotate({rotate} {x} {y})" '
+            f'fill="{color}" font-size="30" font-weight="900" '
+            f'font-family="Arial, sans-serif">{html.escape(char)}</text>'
+        )
+
+    for _ in range(5):
+        x1 = secrets.randbelow(width)
+        y1 = secrets.randbelow(height)
+        x2 = secrets.randbelow(width)
+        y2 = secrets.randbelow(height)
+        color = secrets.choice(["#b8efd2", "#76c8ee", "#f5c462", "#ef7d55"])
+        line_items.append(
+            f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
+            f'stroke="{color}" stroke-width="2" opacity=".55"/>'
+        )
+
+    for _ in range(22):
+        cx = secrets.randbelow(width)
+        cy = secrets.randbelow(height)
+        r = 1 + secrets.randbelow(3)
+        dot_items.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="#174d35" opacity=".12"/>')
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+        f'role="img" aria-label="安全验证码">'
+        '<rect width="180" height="70" rx="8" fill="#f6faf5"/>'
+        + "".join(dot_items)
+        + "".join(line_items)
+        + "".join(text_items)
+        + "</svg>"
+    )
+
+
+def create_captcha() -> dict[str, str]:
+    answer = generate_captcha_answer()
+    captcha_id = secrets.token_urlsafe(18)
+    image_svg = captcha_svg(answer)
+    expires_at = now_ts() + CAPTCHA_TTL_SECONDS
+    with connect_db() as conn:
+        conn.execute("DELETE FROM captcha_challenges WHERE expires_at < ?", (now_ts(),))
+        conn.execute(
+            """
+            INSERT INTO captcha_challenges (captcha_id, answer_hash, image_svg, expires_at, used)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            (captcha_id, hash_captcha(answer), image_svg, expires_at),
+        )
+    return {"captcha_id": captcha_id, "image_url": f"/captcha-image/{captcha_id}.svg"}
+
+
+def get_captcha_image(captcha_id: str) -> str | None:
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT image_svg FROM captcha_challenges
+            WHERE captcha_id = ? AND used = 0 AND expires_at >= ?
+            """,
+            (captcha_id, now_ts()),
+        ).fetchone()
+    return None if row is None else row["image_svg"]
+
+
+def validate_captcha(captcha_id: Any, answer: Any) -> None:
+    captcha_id = str(captcha_id or "")
+    submitted = str(answer or "").strip().upper()
+    if not captcha_id or not submitted:
+        raise ValueError("captcha is required")
+
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM captcha_challenges WHERE captcha_id = ?",
+            (captcha_id,),
+        ).fetchone()
+        if row is None or row["used"] or row["expires_at"] < now_ts():
+            raise ValueError("captcha expired, please refresh")
+        if row["answer_hash"] != hash_captcha(submitted):
+            raise ValueError("captcha is incorrect")
+        conn.execute(
+            "UPDATE captcha_challenges SET used = 1 WHERE captcha_id = ?",
+            (captcha_id,),
+        )
+
+
+def create_session(name: str) -> dict[str, str]:
+    user_id = user_id_for_name(name)
+    token = secrets.token_urlsafe(32)
+    expires_at = now_ts() + SESSION_TTL_SECONDS
+    with connect_db() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now_ts(),))
+        conn.execute(
+            """
+            INSERT INTO sessions (token, user_id, name, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (token, user_id, name, expires_at, utc_now_iso()),
+        )
+    return {"token": token, "user_id": user_id, "name": name}
+
+
+def get_session(token: str | None) -> dict[str, str] | None:
+    if not token:
+        return None
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE token = ? AND expires_at >= ?",
+            (token, now_ts()),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"user_id": row["user_id"], "name": row["name"], "token": row["token"]}
+
+
 def connect_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -162,15 +322,43 @@ def init_db() -> None:
             )
             """
         )
-        ensure_column(conn, "activity_type", "activity_type TEXT NOT NULL DEFAULT 'walk'")
-        ensure_column(conn, "duration_minutes", "duration_minutes INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "calories", "calories INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "walk_records", "activity_type", "activity_type TEXT NOT NULL DEFAULT 'walk'")
+        ensure_column(conn, "walk_records", "duration_minutes", "duration_minutes INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "walk_records", "calories", "calories INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS captcha_challenges (
+                captcha_id TEXT PRIMARY KEY,
+                answer_hash TEXT NOT NULL,
+                image_svg TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        ensure_column(conn, "captcha_challenges", "image_svg", "image_svg TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
-def ensure_column(conn: sqlite3.Connection, column_name: str, definition: str) -> None:
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(walk_records)")}
+def ensure_column(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    definition: str,
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
     if column_name not in columns:
-        conn.execute(f"ALTER TABLE walk_records ADD COLUMN {definition}")
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {definition}")
 
 
 def row_to_record(row: sqlite3.Row | None, target_date: str) -> dict[str, Any]:
@@ -349,7 +537,6 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
             query = parse_qs(parsed.query)
-            user_id = query.get("user_id", [DEFAULT_USER_ID])[0] or DEFAULT_USER_ID
 
             if path == "/":
                 self.send_html(INDEX_PATH.read_text(encoding="utf-8"))
@@ -375,6 +562,30 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "service": "walk-tracker-backend"})
                 return
 
+            if path == "/captcha":
+                self.send_json(create_captcha())
+                return
+
+            if path.startswith("/captcha-image/"):
+                captcha_id = path.split("/", 2)[2].removesuffix(".svg")
+                image_svg = get_captcha_image(captcha_id)
+                if image_svg is None:
+                    self.send_error_json(404, "captcha not found")
+                    return
+                self.send_svg(image_svg)
+                return
+
+            if path == "/me":
+                session = self.current_session()
+                if session is None:
+                    self.send_error_json(401, "login required")
+                    return
+                self.send_json({"user": {"name": session["name"]}})
+                return
+
+            session = self.require_session()
+            user_id = session["user_id"]
+
             if path == "/records/today":
                 self.send_json({"record": get_record(user_id, today_string())})
                 return
@@ -395,6 +606,8 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 return
 
             self.send_error_json(404, "not found")
+        except PermissionError as exc:
+            self.send_error_json(401, str(exc))
         except ValueError as exc:
             self.send_error_json(400, str(exc))
         except Exception as exc:  # pragma: no cover - last line of defense for API use
@@ -404,12 +617,33 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
+
+            if path == "/login":
+                payload = self.read_json_body()
+                name = normalize_name(payload.get("name"))
+                validate_captcha(payload.get("captcha_id"), payload.get("captcha_answer"))
+                session = create_session(name)
+                self.send_json(
+                    {"user": {"name": session["name"]}},
+                    status=201,
+                    headers={"Set-Cookie": self.session_cookie(session["token"])},
+                )
+                return
+
+            if path == "/logout":
+                self.send_json(
+                    {"ok": True},
+                    headers={"Set-Cookie": self.clear_session_cookie()},
+                )
+                return
+
             if path != "/records/check-in":
                 self.send_error_json(404, "not found")
                 return
 
+            session = self.require_session()
             payload = self.read_json_body()
-            user_id = str(payload.get("user_id") or DEFAULT_USER_ID)
+            user_id = session["user_id"]
             target_date = str(payload.get("date") or today_string())
             activity_type = normalize_activity_type(payload.get("activity_type"))
             steps = normalize_steps(payload.get("steps"))
@@ -431,6 +665,8 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 calories=calories,
             )
             self.send_json({"record": record}, status=201)
+        except PermissionError as exc:
+            self.send_error_json(401, str(exc))
         except ValueError as exc:
             self.send_error_json(400, str(exc))
         except Exception as exc:  # pragma: no cover
@@ -444,8 +680,9 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 self.send_error_json(404, "not found")
                 return
 
+            session = self.require_session()
             payload = self.read_json_body()
-            user_id = str(payload.get("user_id") or DEFAULT_USER_ID)
+            user_id = session["user_id"]
             target_date = path.split("/", 2)[2]
             existing = get_record(user_id, target_date)
 
@@ -475,6 +712,8 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 calories=calories,
             )
             self.send_json({"record": record})
+        except PermissionError as exc:
+            self.send_error_json(401, str(exc))
         except ValueError as exc:
             self.send_error_json(400, str(exc))
         except Exception as exc:  # pragma: no cover
@@ -489,10 +728,13 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 self.send_error_json(404, "not found")
                 return
 
-            user_id = query.get("user_id", [DEFAULT_USER_ID])[0] or DEFAULT_USER_ID
+            session = self.require_session()
+            user_id = session["user_id"]
             target_date = path.split("/", 2)[2]
             deleted = delete_record(user_id, target_date)
             self.send_json({"deleted": deleted})
+        except PermissionError as exc:
+            self.send_error_json(401, str(exc))
         except ValueError as exc:
             self.send_error_json(400, str(exc))
         except Exception as exc:  # pragma: no cover
@@ -512,11 +754,47 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return payload
 
-    def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+    def current_session(self) -> dict[str, str] | None:
+        raw_cookie = self.headers.get("Cookie", "")
+        jar = cookies.SimpleCookie()
+        jar.load(raw_cookie)
+        morsel = jar.get(SESSION_COOKIE_NAME)
+        token = morsel.value if morsel is not None else None
+        return get_session(token)
+
+    def require_session(self) -> dict[str, str]:
+        session = self.current_session()
+        if session is None:
+            raise PermissionError("login required")
+        return session
+
+    def session_cookie(self, token: str) -> str:
+        cookie = (
+            f"{SESSION_COOKIE_NAME}={token}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "
+            "HttpOnly; SameSite=Lax"
+        )
+        if self.headers.get("X-Forwarded-Proto") == "https":
+            cookie += "; Secure"
+        return cookie
+
+    def clear_session_cookie(self) -> str:
+        cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+        if self.headers.get("X-Forwarded-Proto") == "https":
+            cookie += "; Secure"
+        return cookie
+
+    def send_json(
+        self,
+        payload: dict[str, Any],
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_common_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -526,6 +804,16 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_common_headers()
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_svg(self, svg: str, status: int = 200) -> None:
+        body = svg.encode("utf-8")
+        self.send_response(status)
+        self.send_common_headers()
+        self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

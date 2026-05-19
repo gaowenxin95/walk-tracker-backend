@@ -128,6 +128,42 @@
       font-weight: 700;
     }
 
+    .user-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .user-chip {
+      min-height: 44px;
+      display: none;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--green);
+      padding: 8px 10px;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    body.is-authed .user-chip {
+      display: inline-flex;
+    }
+
+    .ghost-button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #ffffff;
+      color: var(--muted);
+      padding: 0 10px;
+      font-size: 13px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+
     .hero {
       position: relative;
       min-height: 300px;
@@ -385,6 +421,83 @@
       font-weight: 800;
     }
 
+    .login-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(16, 37, 29, 0.48);
+      backdrop-filter: blur(12px);
+    }
+
+    body.auth-needed .login-overlay {
+      display: flex;
+    }
+
+    body.auth-needed .app {
+      filter: blur(5px);
+      pointer-events: none;
+      user-select: none;
+    }
+
+    .login-card {
+      width: min(420px, 100%);
+      border: 1px solid rgba(255, 255, 255, 0.7);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 28px 80px rgba(17, 24, 21, 0.28);
+      padding: 22px;
+    }
+
+    .login-card h2 {
+      font-size: 28px;
+      letter-spacing: 0;
+    }
+
+    .login-card p {
+      color: var(--muted);
+      line-height: 1.5;
+      margin-top: 8px;
+    }
+
+    .login-form {
+      display: grid;
+      gap: 13px;
+      margin-top: 18px;
+    }
+
+    .captcha-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .captcha-image {
+      min-height: 70px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: #f6faf5;
+    }
+
+    .captcha-image img {
+      display: block;
+      width: 100%;
+      height: 70px;
+      object-fit: cover;
+    }
+
+    .login-message {
+      min-height: 20px;
+      color: #b85135;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
     .metrics {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -607,9 +720,15 @@
           <p class="date" id="todayDate">--</p>
         </div>
       </div>
-      <div class="streak">
-        <strong id="topStreak">0</strong>
-        <span>连续天数</span>
+      <div class="user-bar">
+        <div class="user-chip">
+          <span id="userName">--</span>
+          <button class="ghost-button" type="button" id="logoutButton">退出</button>
+        </div>
+        <div class="streak">
+          <strong id="topStreak">0</strong>
+          <span>连续天数</span>
+        </div>
       </div>
     </header>
 
@@ -714,6 +833,29 @@
     </section>
   </main>
 
+  <section class="login-overlay" id="loginOverlay" aria-modal="true" role="dialog">
+    <div class="login-card">
+      <h2>登录动迹</h2>
+      <p>输入姓名并完成安全图验证。</p>
+      <form class="login-form" id="loginForm">
+        <div class="field">
+          <label for="loginNameInput">姓名</label>
+          <input id="loginNameInput" name="name" type="text" maxlength="30" autocomplete="name" placeholder="请输入姓名">
+        </div>
+        <div class="field">
+          <label for="captchaAnswerInput">安全图验证</label>
+          <div class="captcha-row">
+            <div class="captcha-image" id="captchaImage"></div>
+            <button class="ghost-button" type="button" id="refreshCaptchaButton">换一张</button>
+          </div>
+          <input id="captchaAnswerInput" name="captcha" type="text" maxlength="8" autocomplete="off" inputmode="text" placeholder="输入图中字符">
+        </div>
+        <button class="primary" type="submit" id="loginButton">进入动迹</button>
+        <p class="login-message" id="loginMessage"></p>
+      </form>
+    </div>
+  </section>
+
   <script>
     const ACTIVITIES = {
       walk: {
@@ -765,7 +907,18 @@
     const message = document.querySelector("#message");
     const activityGrid = document.querySelector("#activityGrid");
     const selectedActivityText = document.querySelector("#selectedActivityText");
+    const loginForm = document.querySelector("#loginForm");
+    const loginNameInput = document.querySelector("#loginNameInput");
+    const captchaAnswerInput = document.querySelector("#captchaAnswerInput");
+    const captchaImage = document.querySelector("#captchaImage");
+    const refreshCaptchaButton = document.querySelector("#refreshCaptchaButton");
+    const loginButton = document.querySelector("#loginButton");
+    const loginMessage = document.querySelector("#loginMessage");
+    const logoutButton = document.querySelector("#logoutButton");
+    const userName = document.querySelector("#userName");
     let selectedActivity = "walk";
+    let currentUser = null;
+    let captchaId = null;
 
     const formatNumber = new Intl.NumberFormat("zh-CN");
     const weekday = new Intl.DateTimeFormat("zh-CN", { weekday: "short" });
@@ -829,11 +982,58 @@
     }
 
     async function fetchStats() {
-      const response = await fetch("/stats?days=7");
+      const response = await fetch("/stats?days=7", { credentials: "same-origin" });
+      if (response.status === 401) {
+        await showLogin();
+        throw new Error("请先登录");
+      }
       if (!response.ok) {
         throw new Error("统计数据加载失败");
       }
       return response.json();
+    }
+
+    async function loadCaptcha() {
+      loginMessage.textContent = "";
+      captchaAnswerInput.value = "";
+      const response = await fetch("/captcha", { credentials: "same-origin" });
+      if (!response.ok) {
+        loginMessage.textContent = "验证码加载失败";
+        return;
+      }
+      const payload = await response.json();
+      captchaId = payload.captcha_id;
+      captchaImage.innerHTML = "";
+      const image = document.createElement("img");
+      image.src = `${payload.image_url}?t=${Date.now()}`;
+      image.alt = "安全验证码";
+      captchaImage.appendChild(image);
+    }
+
+    async function showLogin() {
+      currentUser = null;
+      document.body.classList.remove("is-authed");
+      document.body.classList.add("auth-needed");
+      await loadCaptcha();
+      setTimeout(() => loginNameInput.focus(), 50);
+    }
+
+    function hideLogin(user) {
+      currentUser = user;
+      userName.textContent = user.name;
+      document.body.classList.remove("auth-needed");
+      document.body.classList.add("is-authed");
+    }
+
+    async function checkSession() {
+      const response = await fetch("/me", { credentials: "same-origin" });
+      if (!response.ok) {
+        await showLogin();
+        return;
+      }
+      const payload = await response.json();
+      hideLogin(payload.user);
+      await load();
     }
 
     function activityLabel(activityType) {
@@ -912,10 +1112,15 @@
     async function load() {
       message.textContent = "";
       document.querySelector("#todayDate").textContent = longDate.format(new Date());
+      if (!currentUser) {
+        return;
+      }
       try {
         renderStats(await fetchStats());
       } catch (error) {
-        message.textContent = error.message;
+        if (error.message !== "请先登录") {
+          message.textContent = error.message;
+        }
       }
     }
 
@@ -936,6 +1141,7 @@
         const response = await fetch("/records/check-in", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
           body: JSON.stringify({
             activity_type: selectedActivity,
             steps,
@@ -945,6 +1151,10 @@
             note: noteInput.value.trim() || null
           })
         });
+        if (response.status === 401) {
+          await showLogin();
+          throw new Error("请先登录");
+        }
         if (!response.ok) {
           const payload = await response.json();
           throw new Error(payload.error || "打卡失败");
@@ -957,9 +1167,50 @@
       }
     });
 
+    loginForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      loginButton.disabled = true;
+      loginMessage.textContent = "";
+
+      try {
+        const response = await fetch("/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            name: loginNameInput.value.trim(),
+            captcha_id: captchaId,
+            captcha_answer: captchaAnswerInput.value.trim()
+          })
+        });
+
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || "登录失败");
+        }
+        hideLogin(payload.user);
+        await load();
+      } catch (error) {
+        loginMessage.textContent = error.message;
+        await loadCaptcha();
+      } finally {
+        loginButton.disabled = false;
+      }
+    });
+
+    refreshCaptchaButton.addEventListener("click", loadCaptcha);
+
+    logoutButton.addEventListener("click", async () => {
+      await fetch("/logout", {
+        method: "POST",
+        credentials: "same-origin"
+      });
+      await showLogin();
+    });
+
     renderActivityButtons();
     refreshPreview();
-    load();
+    checkSession();
 
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => {

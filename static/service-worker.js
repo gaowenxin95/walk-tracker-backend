@@ -1,4 +1,4 @@
-const CACHE_NAME = "walk-tracker-v2";
+const CACHE_NAME = "walk-tracker-v3";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
@@ -25,7 +25,15 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  if (url.pathname.startsWith("/stats") || url.pathname.startsWith("/records")) {
+  if (
+    url.pathname.startsWith("/stats") ||
+    url.pathname.startsWith("/records") ||
+    url.pathname === "/captcha" ||
+    url.pathname.startsWith("/captcha-image/") ||
+    url.pathname === "/me" ||
+    url.pathname === "/login" ||
+    url.pathname === "/logout"
+  ) {
     event.respondWith(fetch(event.request));
     return;
   }

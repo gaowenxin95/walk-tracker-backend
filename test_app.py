@@ -87,6 +87,21 @@ class WalkTrackerTestCase(unittest.TestCase):
         self.assertEqual(stats["total_duration_minutes"], 32)
         self.assertEqual(stats["activity_counts"], {"run": 1})
 
+    def test_captcha_and_session_helpers(self):
+        captcha = self.app.create_captcha()
+        self.assertIn("captcha_id", captcha)
+        self.assertIn("image_url", captcha)
+        self.assertIn("<svg", self.app.get_captcha_image(captcha["captcha_id"]))
+
+        with self.assertRaises(ValueError):
+            self.app.validate_captcha(captcha["captcha_id"], "wrong")
+
+        session = self.app.create_session("高文欣")
+        found = self.app.get_session(session["token"])
+
+        self.assertEqual(found["name"], "高文欣")
+        self.assertEqual(found["user_id"], session["user_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
