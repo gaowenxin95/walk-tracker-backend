@@ -1,4 +1,4 @@
-const CACHE_NAME = "walk-tracker-v4";
+const CACHE_NAME = "walk-tracker-v5";
 const APP_SHELL = [
   "/",
   "/manifest.webmanifest",
