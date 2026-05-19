@@ -25,6 +25,15 @@ INDEX_PATH = APP_DIR / "static" / "index.html"
 DB_PATH = Path(os.environ.get("WALK_TRACKER_DB", DATA_DIR / "walk_records.sqlite3"))
 DEFAULT_USER_ID = "default"
 DEFAULT_STRIDE_METERS = 0.7
+DEFAULT_ACTIVITY_TYPE = "walk"
+ACTIVITY_TYPES = {"walk", "run", "rope", "swim"}
+ACTIVITY_METS = {
+    "walk": 3.5,
+    "run": 8.3,
+    "rope": 10.0,
+    "swim": 7.0,
+}
+DEFAULT_WEIGHT_KG = 60
 DEFAULT_HOST = os.environ.get("HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("PORT", "8000"))
 
@@ -80,8 +89,49 @@ def normalize_stride(value: Any) -> float:
     return stride
 
 
+def normalize_activity_type(value: Any) -> str:
+    if value is None or value == "":
+        return DEFAULT_ACTIVITY_TYPE
+    activity_type = str(value).strip().lower()
+    if activity_type not in ACTIVITY_TYPES:
+        allowed = ", ".join(sorted(ACTIVITY_TYPES))
+        raise ValueError(f"activity_type must be one of: {allowed}")
+    return activity_type
+
+
+def normalize_minutes(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("duration_minutes must be an integer") from exc
+    if minutes < 0:
+        raise ValueError("duration_minutes cannot be negative")
+    return minutes
+
+
+def normalize_calories(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        calories = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("calories must be an integer") from exc
+    if calories < 0:
+        raise ValueError("calories cannot be negative")
+    return calories
+
+
 def distance_km_for_steps(steps: int, stride_meters: float) -> float:
     return round((steps * stride_meters) / 1000, 2)
+
+
+def estimate_calories(activity_type: str, duration_minutes: int) -> int:
+    if duration_minutes <= 0:
+        return 0
+    met = ACTIVITY_METS.get(activity_type, ACTIVITY_METS[DEFAULT_ACTIVITY_TYPE])
+    return round(met * 3.5 * DEFAULT_WEIGHT_KG / 200 * duration_minutes)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -98,10 +148,13 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS walk_records (
                 user_id TEXT NOT NULL,
                 date TEXT NOT NULL,
+                activity_type TEXT NOT NULL DEFAULT 'walk',
                 checked_in INTEGER NOT NULL DEFAULT 0,
                 steps INTEGER NOT NULL DEFAULT 0,
+                duration_minutes INTEGER NOT NULL DEFAULT 0,
                 stride_meters REAL NOT NULL DEFAULT 0.7,
                 distance_km REAL NOT NULL DEFAULT 0,
+                calories INTEGER NOT NULL DEFAULT 0,
                 note TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -109,16 +162,28 @@ def init_db() -> None:
             )
             """
         )
+        ensure_column(conn, "activity_type", "activity_type TEXT NOT NULL DEFAULT 'walk'")
+        ensure_column(conn, "duration_minutes", "duration_minutes INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "calories", "calories INTEGER NOT NULL DEFAULT 0")
+
+
+def ensure_column(conn: sqlite3.Connection, column_name: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(walk_records)")}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE walk_records ADD COLUMN {definition}")
 
 
 def row_to_record(row: sqlite3.Row | None, target_date: str) -> dict[str, Any]:
     if row is None:
         return {
             "date": target_date,
+            "activity_type": DEFAULT_ACTIVITY_TYPE,
             "checked_in": False,
             "steps": 0,
+            "duration_minutes": 0,
             "stride_meters": DEFAULT_STRIDE_METERS,
             "distance_km": 0,
+            "calories": 0,
             "note": None,
             "created_at": None,
             "updated_at": None,
@@ -126,10 +191,13 @@ def row_to_record(row: sqlite3.Row | None, target_date: str) -> dict[str, Any]:
 
     return {
         "date": row["date"],
+        "activity_type": row["activity_type"],
         "checked_in": bool(row["checked_in"]),
         "steps": row["steps"],
+        "duration_minutes": row["duration_minutes"],
         "stride_meters": row["stride_meters"],
         "distance_km": row["distance_km"],
+        "calories": row["calories"],
         "note": row["note"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -154,33 +222,44 @@ def upsert_record(
     steps: int,
     stride_meters: float,
     note: str | None,
+    activity_type: str = DEFAULT_ACTIVITY_TYPE,
+    duration_minutes: int = 0,
+    calories: int | None = None,
 ) -> dict[str, Any]:
     parse_date(target_date)
+    activity_type = normalize_activity_type(activity_type)
     distance_km = distance_km_for_steps(steps, stride_meters)
+    calories = calories if calories is not None else estimate_calories(activity_type, duration_minutes)
     now = utc_now_iso()
     with connect_db() as conn:
         conn.execute(
             """
             INSERT INTO walk_records (
-                user_id, date, checked_in, steps, stride_meters,
-                distance_km, note, created_at, updated_at
+                user_id, date, activity_type, checked_in, steps, duration_minutes,
+                stride_meters, distance_km, calories, note, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, date) DO UPDATE SET
+                activity_type = excluded.activity_type,
                 checked_in = excluded.checked_in,
                 steps = excluded.steps,
+                duration_minutes = excluded.duration_minutes,
                 stride_meters = excluded.stride_meters,
                 distance_km = excluded.distance_km,
+                calories = excluded.calories,
                 note = excluded.note,
                 updated_at = excluded.updated_at
             """,
             (
                 user_id,
                 target_date,
+                activity_type,
                 int(checked_in),
                 steps,
+                duration_minutes,
                 stride_meters,
                 distance_km,
+                calories,
                 note,
                 now,
                 now,
@@ -225,8 +304,15 @@ def stats_for_days(user_id: str, days: int) -> dict[str, Any]:
     records = records_for_days(user_id, days)
     total_steps = sum(item["steps"] for item in records)
     total_distance_km = round(sum(item["distance_km"] for item in records), 2)
+    total_duration_minutes = sum(item["duration_minutes"] for item in records)
+    total_calories = sum(item["calories"] for item in records)
     checked_in_days = sum(1 for item in records if item["checked_in"])
     average_steps = round(total_steps / days) if days else 0
+    activity_counts: dict[str, int] = {}
+    for item in records:
+        if item["checked_in"]:
+            activity_type = item["activity_type"]
+            activity_counts[activity_type] = activity_counts.get(activity_type, 0) + 1
 
     streak_days = 0
     for item in reversed(records):
@@ -241,8 +327,11 @@ def stats_for_days(user_id: str, days: int) -> dict[str, Any]:
         "missed_days": days - checked_in_days,
         "total_steps": total_steps,
         "total_distance_km": total_distance_km,
+        "total_duration_minutes": total_duration_minutes,
+        "total_calories": total_calories,
         "average_steps": average_steps,
         "streak_days": streak_days,
+        "activity_counts": activity_counts,
         "records": records,
     }
 
@@ -275,6 +364,10 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 return
 
             if path.startswith("/icons/"):
+                self.send_static_file(path)
+                return
+
+            if path.startswith("/assets/"):
                 self.send_static_file(path)
                 return
 
@@ -318,8 +411,11 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             user_id = str(payload.get("user_id") or DEFAULT_USER_ID)
             target_date = str(payload.get("date") or today_string())
+            activity_type = normalize_activity_type(payload.get("activity_type"))
             steps = normalize_steps(payload.get("steps"))
+            duration_minutes = normalize_minutes(payload.get("duration_minutes"))
             stride_meters = normalize_stride(payload.get("stride_meters"))
+            calories = normalize_calories(payload.get("calories"))
             note = payload.get("note")
             checked_in = to_bool(payload.get("checked_in"), default=True)
 
@@ -330,6 +426,9 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 steps=steps,
                 stride_meters=stride_meters,
                 note=note,
+                activity_type=activity_type,
+                duration_minutes=duration_minutes,
+                calories=calories,
             )
             self.send_json({"record": record}, status=201)
         except ValueError as exc:
@@ -350,10 +449,17 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
             target_date = path.split("/", 2)[2]
             existing = get_record(user_id, target_date)
 
+            activity_type = normalize_activity_type(
+                payload.get("activity_type", existing["activity_type"])
+            )
             steps = normalize_steps(payload.get("steps", existing["steps"]))
+            duration_minutes = normalize_minutes(
+                payload.get("duration_minutes", existing["duration_minutes"])
+            )
             stride_meters = normalize_stride(
                 payload.get("stride_meters", existing["stride_meters"])
             )
+            calories = normalize_calories(payload.get("calories", existing["calories"]))
             checked_in = to_bool(payload.get("checked_in"), existing["checked_in"])
             note = payload.get("note", existing["note"])
 
@@ -364,6 +470,9 @@ class WalkTrackerHandler(BaseHTTPRequestHandler):
                 steps=steps,
                 stride_meters=stride_meters,
                 note=note,
+                activity_type=activity_type,
+                duration_minutes=duration_minutes,
+                calories=calories,
             )
             self.send_json({"record": record})
         except ValueError as exc:

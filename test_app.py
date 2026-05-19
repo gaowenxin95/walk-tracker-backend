@@ -65,6 +65,28 @@ class WalkTrackerTestCase(unittest.TestCase):
         self.assertEqual(stats["total_distance_km"], 0.7)
         self.assertEqual(stats["streak_days"], 1)
 
+    def test_activity_fields_are_saved_and_aggregated(self):
+        record = self.app.upsert_record(
+            user_id="u1",
+            target_date=self.app.today_string(),
+            checked_in=True,
+            steps=6200,
+            stride_meters=1.05,
+            note="morning run",
+            activity_type="run",
+            duration_minutes=32,
+            calories=None,
+        )
+
+        stats = self.app.stats_for_days("u1", 7)
+
+        self.assertEqual(record["activity_type"], "run")
+        self.assertEqual(record["duration_minutes"], 32)
+        self.assertEqual(record["distance_km"], 6.51)
+        self.assertGreater(record["calories"], 0)
+        self.assertEqual(stats["total_duration_minutes"], 32)
+        self.assertEqual(stats["activity_counts"], {"run": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

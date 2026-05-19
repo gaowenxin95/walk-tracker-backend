@@ -1,7 +1,7 @@
 {
-  "name": "走路打卡",
-  "short_name": "走路打卡",
-  "description": "记录每日走路打卡、步数和公里数。",
+  "name": "动迹",
+  "short_name": "动迹",
+  "description": "记录每日运动、步数、公里数和训练时长。",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
